@@ -1,0 +1,253 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office"
+      xmlns:w="urn:schemas-microsoft-com:office:word"
+      xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<!--[if gte mso 9]><xml>
+<w:WordDocument>
+<w:View>Print</w:View>
+<w:Zoom>100</w:Zoom>
+</w:WordDocument>
+</xml><![endif]-->
+<style>
+@page { size: A4; margin: 2cm; }
+body { font-family: '宋体', SimSun, serif; font-size: 12pt; line-height: 1.8; color: #000; }
+h1 { font-size: 18pt; font-weight: bold; text-align: center; margin-bottom: 6pt; page-break-before: always; }
+h1.no-break { page-break-before: avoid; }
+h2 { font-size: 14pt; font-weight: bold; margin-top: 18pt; margin-bottom: 6pt; border-bottom: 1px solid #999; padding-bottom: 3pt; }
+h3 { font-size: 12pt; font-weight: bold; margin-top: 12pt; margin-bottom: 4pt; }
+p { margin: 4pt 0; text-indent: 2em; }
+p.no-indent { text-indent: 0; }
+p.subtitle { text-align: center; font-size: 10pt; color: #555; text-indent: 0; }
+table { border-collapse: collapse; width: 100%; margin: 8pt 0; }
+th, td { border: 1px solid #000; padding: 4pt 6pt; font-size: 10pt; text-align: center; }
+th { background-color: #ddd; font-weight: bold; }
+td.left { text-align: left; }
+ul, ol { margin: 4pt 0 4pt 2em; }
+li { margin: 2pt 0; }
+code { font-family: Consolas, monospace; font-size: 9pt; background: #f0f0f0; padding: 1pt 3pt; }
+pre { font-family: Consolas, monospace; font-size: 9pt; background: #f0f0f0; padding: 6pt; border: 1px solid #ccc; margin: 4pt 0; }
+strong { color: #003399; }
+.green { color: #008800; }
+.note { font-size: 9pt; color: #666; text-indent: 0; }
+</style>
+</head>
+<body>
+
+<h1 class="no-break">对称密码算法的软件实现</h1>
+<p class="subtitle">实验报告 &emsp;| &emsp;2026-07-30 &emsp;| &emsp;环境：gcc -O3 -march=native, x86_64, Ubuntu</p>
+
+<!-- 目录 -->
+<h2>目&emsp;录</h2>
+<p class="no-indent"><strong>1.</strong> 实验目的 &emsp; <strong>2.</strong> 项目架构 &emsp; <strong>3.</strong> 算法实现与优化方法 &emsp; <strong>4.</strong> 工作模式 &emsp; <strong>5.</strong> 性能总览 &emsp; <strong>6.</strong> 优化方法分析 &emsp; <strong>7.</strong> 结论</p>
+
+<!-- ============ 1. 实验目的 ============ -->
+<h2>1. 实验目的</h2>
+<ol>
+  <li>掌握四种对称密码算法（AES-128、SM4、GIFT-128、TWINE-128）的基本结构与优化原理。</li>
+  <li>实现并对比多种软件优化方法：<strong>T-table 查表合并</strong>、<strong>SIMD shuffle（SSSE3）</strong>、<strong>bitslice（SSE2/SSSE3）</strong>以及<strong>硬件指令加速（AES-NI）</strong>。</li>
+  <li>基于统一的分组密码接口 <code>block_cipher_t</code>，实现 <strong>CTR</strong>、<strong>GCM</strong>、<strong>XTS</strong> 三种工作模式，并验证正确性与性能。</li>
+</ol>
+
+<!-- ============ 2. 项目架构 ============ -->
+<h2>2. 项目整体架构</h2>
+
+<h3>2.1 源码结构</h3>
+<pre>
+src/
+├── algo_if.h              # 统一分组密码接口 block_cipher_t
+├── common.h / common.c    # 计时函数、常量
+├── config.h               # 编译选项
+├── modes.h / modes.c      # CTR, GCM, XTS 工作模式（与算法解耦）
+│
+├── aes_basic.c            # AES basic（逐字节 S-box）
+├── aes_ttable.c           # AES T-table（4×256 合并查表）
+├── aes_shuffle.c          # AES SSSE3 shuffle
+├── aes_ni.c               # AES AES-NI 硬件指令
+│
+├── sm4_basic.c            # SM4 basic（逐字节 S-box）
+├── sm4_ttable.c           # SM4 T-table（合并 S-box + L/L'）
+├── sm4_shuffle.c          # SM4 SSSE3 shuffle
+│
+├── gift128_basic.c        # GIFT basic（NIST fixsliced 参考实现）
+├── gift128_bitslice.c     # GIFT SSE2 bitslice
+│
+├── twine128_basic.c       # TWINE basic（逐 nibble）
+├── twine128_bitslice.c    # TWINE SSE2 + SSSE3 PSHUFB bitslice
+│
+├── main_test.c            # 主程序：KAT 验证 + 性能 benchmark
+└── Makefile
+</pre>
+
+<h3>2.2 统一接口设计</h3>
+<p>所有算法均导出统一的 <code>block_cipher_t</code> 结构体（定义于 <code>algo_if.h</code>）：</p>
+<pre>
+typedef struct {
+    void (*encrypt)(void *ctx, const uint8_t *in, uint8_t *out);
+    void (*decrypt)(void *ctx, const uint8_t *in, uint8_t *out);
+    void (*set_key)(void *ctx, const uint8_t *key);
+    unsigned block_size;   /* 8 for TWINE, 16 for the rest */
+    unsigned ctx_size;
+    const char *name;
+} block_cipher_t;
+</pre>
+<p>工作模式（CTR/GCM/XTS）完全基于该接口实现，与具体密码算法<strong>解耦</strong>，可任意组合。</p>
+
+<!-- ============ 3. 算法实现 ============ -->
+<h2>3. 算法实现与优化方法</h2>
+
+<!-- AES -->
+<h3>3.1 AES-128（FIPS 197）</h3>
+<p><strong>算法特点：</strong>128-bit 分组，10 轮 SPN 结构，S-box 为 GF(2⁸) 逆元 + 仿射变换。</p>
+
+<table>
+<tr><th>实现</th><th>优化方法</th><th>吞吐量</th><th>vs basic</th><th>原理</th></tr>
+<tr><td class="left">basic</td><td class="left">逐字节 S-box 查表 + MixColumns</td><td>79.8 MB/s</td><td>1.0×</td><td class="left">标准查表</td></tr>
+<tr><td class="left">T-table</td><td class="left">4 张 256 项 × 4 字节预计算表</td><td><strong>418.1 MB/s</strong></td><td>5.2×</td><td class="left">SubBytes + ShiftRows + MixColumns 合并</td></tr>
+<tr><td class="left">SSSE3 shuffle</td><td class="left">_mm_shuffle_epi8 + 128-bit 列混合</td><td>165.2 MB/s</td><td>2.1×</td><td class="left">16 路并行 S-box 查表</td></tr>
+<tr><td class="left">AES-NI</td><td class="left">aesenc / aesenclast 硬件指令</td><td><strong>10,102.1 MB/s</strong></td><td>126.6×</td><td class="left">单指令完成一轮 AES</td></tr>
+</table>
+
+<p><span class="green">✓</span> 全部通过 FIPS 197 附录 C 测试向量（明文 <code>00112233...</code>，密钥 <code>00010203...</code>，密文 <code>69C4E0D8...</code>）。</p>
+
+<!-- SM4 -->
+<h3>3.2 SM4（GB/T 32907-2016）</h3>
+<p><strong>算法特点：</strong>128-bit 分组，32 轮非平衡 Feistel 结构，S-box 为 256 条目置换，线性变换 L(B)=B⊕(B<<<2)⊕(B<<<10)⊕(B<<<18)⊕(B<<<24)。</p>
+
+<table>
+<tr><th>实现</th><th>优化方法</th><th>吞吐量</th><th>vs basic</th></tr>
+<tr><td class="left">basic</td><td class="left">逐字节 S-box + L/L' 线性变换</td><td>136.3 MB/s</td><td>1.0×</td></tr>
+<tr><td class="left">T-table</td><td class="left">8 张 256 项预计算表，S-box+L/L' 合并为查表+异或</td><td><strong>189.8 MB/s</strong></td><td>1.4×</td></tr>
+<tr><td class="left">SSSE3 shuffle</td><td class="left">_mm_shuffle_epi8 并行 S-box + 128-bit 字旋转/异或</td><td>82.2 MB/s</td><td>0.6×</td></tr>
+</table>
+
+<p><span class="green">✓</span> 全部通过 GB/T 32907 测试向量（明文 <code>0123456789ABCDEFFEDCBA9876543210</code>，密钥同上，密文 <code>681EDF34D206965E86B3E94F536E4246</code>）。</p>
+
+<p class="note">※ SM4 SSSE3 慢于 basic，原因为非平衡 Feistel 结构的 128-bit 字旋转操作在 SIMD 中开销较大，抵消了 S-box 并行化收益。</p>
+
+<!-- GIFT-128 -->
+<h3>3.3 GIFT-128（NIST 轻量级密码标准）</h3>
+<p><strong>算法特点：</strong>128-bit 分组，128-bit 密钥，40 轮迭代。使用 4-bit S-box（仅需 ~20 个逻辑门）和 128-bit bit-permutation，天然适合 bitslice 实现。</p>
+
+<table>
+<tr><th>实现</th><th>优化方法</th><th>吞吐量</th><th>说明</th></tr>
+<tr><td class="left">basic</td><td class="left">NIST 参考 fixsliced 实现（32-bit 字内并行 4 个 nibble）</td><td>111.2 MB/s</td><td class="left">基准</td></tr>
+<tr><td class="left">bitslice</td><td class="left">SSE2 128-bit 并行逻辑门运算</td><td>113.1 MB/s</td><td class="left">1 个寄存器处理 128 个分组</td></tr>
+</table>
+
+<p><span class="green">✓</span> 全部通过 NIST 参考实现测试向量（TV#3）验证。</p>
+
+<!-- TWINE-128 -->
+<h3>3.4 TWINE-128（ISO/IEC 29192）</h3>
+<p><strong>算法特点：</strong><strong>64-bit 分组</strong>（唯一非 128-bit），36 轮广义 Feistel 结构。使用 4-bit S-box 和基于 nibble 的 16 路 shuffle，RCON 为 6-bit LFSR（x⁶+x+1）。</p>
+
+<table>
+<tr><th>实现</th><th>优化方法</th><th>吞吐量</th><th>vs basic</th></tr>
+<tr><td class="left">basic</td><td class="left">逐 nibble S-box + 软件 16-nibble shuffle</td><td>10.1 MB/s</td><td>1.0×</td></tr>
+<tr><td class="left">bitslice</td><td class="left">SSE2 128-bit 并行 + SSSE3 PSHUFB 加速 shuffle</td><td><strong>13.5 MB/s</strong></td><td>1.34×</td></tr>
+</table>
+
+<p><span class="green">✓</span> basic 与 bitslice 交叉验证通过（输出完全一致），均可正确加解密。吞吐量较低源于 64-bit 分组大小。</p>
+
+<!-- ============ 4. 工作模式 ============ -->
+<h2>4. 工作模式实现</h2>
+<p>三种工作模式均基于 <code>block_cipher_t</code> 接口实现（<code>modes.h / modes.c</code>），与具体密码算法解耦。</p>
+
+<table>
+<tr><th>模式</th><th>标准</th><th>加解密</th><th>认证</th><th>功能测试</th></tr>
+<tr>
+  <td><strong>CTR</strong></td>
+  <td class="left">NIST SP 800-38A</td>
+  <td class="left">Cᵢ = Pᵢ ⊕ Eₖ(Counter + i)，加解密完全对称</td>
+  <td>无</td>
+  <td class="green">✓ PASS</td>
+</tr>
+<tr>
+  <td><strong>GCM</strong></td>
+  <td class="left">NIST SP 800-38D</td>
+  <td class="left">CTR 模式加密 + GHASH 认证</td>
+  <td class="left">128-bit tag，GF(2¹²⁸) 乘法</td>
+  <td class="green">✓ PASS</td>
+</tr>
+<tr>
+  <td><strong>XTS</strong></td>
+  <td class="left">IEEE 1619</td>
+  <td class="left">双密钥 + GF(2¹²⁸) tweak + CTS</td>
+  <td>无</td>
+  <td class="green">✓ PASS</td>
+</tr>
+</table>
+
+<h3>4.1 具体设计</h3>
+<ul>
+  <li><strong>CTR：</strong>12 字节 nonce + 4 字节计数器，支持多分组并行。</li>
+  <li><strong>GCM：</strong>实现 GF(2¹²⁸) GHASH 乘法（2-bit 查表加速），支持 AAD 关联数据和 128-bit 认证标签。encrypt+tag 和 decrypt+verify 均通过测试。</li>
+  <li><strong>XTS：</strong>双密钥（key₁ + key₂），GF(2¹²⁸) tweak 生成，支持 CTS 密文挪用（48 字节非整分组测试通过）。</li>
+</ul>
+
+<!-- ============ 5. 性能总览 ============ -->
+<h2>5. 性能对比总览</h2>
+<p>测试条件：ECB 模式加密 16 MB，gcc -O3 -march=native。</p>
+
+<table>
+<tr><th>排名</th><th>算法</th><th>实现</th><th>吞吐量 (MB/s)</th><th>vs basic</th><th>优化方法</th></tr>
+<tr><td>1</td><td class="left">AES-128</td><td class="left"><strong>AES-NI</strong></td><td><strong>10,102.1</strong></td><td>126.6×</td><td class="left">硬件指令</td></tr>
+<tr><td>2</td><td class="left">AES-128</td><td class="left">T-table</td><td>418.1</td><td>5.2×</td><td class="left">合并查表</td></tr>
+<tr><td>3</td><td class="left">SM4</td><td class="left">T-table</td><td>189.8</td><td>1.4×</td><td class="left">合并查表</td></tr>
+<tr><td>4</td><td class="left">AES-128</td><td class="left">SSSE3</td><td>165.2</td><td>2.1×</td><td class="left">SIMD shuffle</td></tr>
+<tr><td>5</td><td class="left">SM4</td><td class="left">basic</td><td>136.3</td><td>1.0×</td><td class="left">基准</td></tr>
+<tr><td>6</td><td class="left">GIFT-128</td><td class="left">bitslice</td><td>113.1</td><td>1.0×</td><td class="left">SSE2 bitslice</td></tr>
+<tr><td>7</td><td class="left">GIFT-128</td><td class="left">basic</td><td>111.2</td><td>1.0×</td><td class="left">基准</td></tr>
+<tr><td>8</td><td class="left">SM4</td><td class="left">SSSE3</td><td>82.2</td><td>0.6×</td><td class="left">SIMD shuffle*</td></tr>
+<tr><td>9</td><td class="left">AES-128</td><td class="left">basic</td><td>79.8</td><td>1.0×</td><td class="left">基准</td></tr>
+<tr><td>10</td><td class="left">TWINE-128</td><td class="left">bitslice</td><td>13.5</td><td>1.34×</td><td class="left">SSSE3 PSHUFB</td></tr>
+<tr><td>11</td><td class="left">TWINE-128</td><td class="left">basic</td><td>10.1</td><td>1.0×</td><td class="left">基准</td></tr>
+</table>
+
+<p class="note">* SM4 SSSE3 慢于 basic：非平衡 Feistel 的 128-bit 旋转操作在 SIMD 中开销大，抵消了 S-box 并行化收益。</p>
+
+<!-- ============ 6. 优化分析 ============ -->
+<h2>6. 优化方法分析</h2>
+
+<h3>6.1 T-table 查表合并</h3>
+<ul>
+  <li><strong>原理：</strong>将 S-box + 线性扩散层（AES 的 MixColumns 或 SM4 的 L/L'）预计算为查找表。AES 需要 4 张 1KB 表，SM4 需要 8 张 1KB 表（加密 4 张 + 密钥扩展 4 张）。一轮加密仅需 4 次查表 + 4 次异或。</li>
+  <li><strong>效果：</strong>AES 提升 5.2×（418 MB/s），SM4 提升 1.4×（190 MB/s）。</li>
+  <li><strong>代价：</strong>AES 4KB / SM4 8KB 内存，L1 缓存友好。</li>
+</ul>
+
+<h3>6.2 SIMD Shuffle（SSSE3 PSHUFB）</h3>
+<ul>
+  <li><strong>原理：</strong><code>_mm_shuffle_epi8(a, b)</code> 一次完成 16 个字节的并行查表（b[i] &lt; 128 时 dst[i] = a[b[i]]），正好是一个 16-way 的 S-box 查表。</li>
+  <li><strong>效果：</strong>AES 提升 2.1×（165 MB/s）。</li>
+  <li><strong>局限：</strong>需要加密结构适配 128-bit 并行布局。AES 的 SPN 结构天然适配，SM4 的非平衡 Feistel 需要额外开销（字旋转、移位），反而变慢。</li>
+</ul>
+
+<h3>6.3 Bitslice（SSE2 / SSSE3）</h3>
+<ul>
+  <li><strong>原理：</strong>将分组按 bit 维度分解，用 SSE2 128-bit 向量同时处理 128 个分组的同一位。S-box 用逻辑门（AND/OR/XOR/NOT）实现，shuffle/permutation 通过 bit 重排完成。</li>
+  <li><strong>效果：</strong>GIFT-128 +1.7%，TWINE-128 +34%。</li>
+  <li><strong>适用场景：</strong>轻量级密码的 4-bit S-box 门电路简洁（GIFT ~20 gates，TWINE ~30 gates），bitslice 可在 128 个并行分组上分摊门延迟。</li>
+</ul>
+
+<h3>6.4 AES-NI 硬件指令</h3>
+<ul>
+  <li><strong>原理：</strong>Intel/AMD 处理器内置的 AES 加速指令集。<code>aesenc</code> 单指令完成 SubBytes + ShiftRows + MixColumns，<code>aesenclast</code> 完成最后一轮（不含 MixColumns），<code>aeskeygenassist</code> 辅助密钥扩展。</li>
+  <li><strong>效果：</strong>10,102 MB/s，比最佳软件实现（T-table）快 <strong>24 倍</strong>，比 basic 快 <strong>127 倍</strong>。</li>
+  <li><strong>局限：</strong>仅支持 AES，不支持 SM4 / GIFT / TWINE。</li>
+</ul>
+
+<!-- ============ 7. 结论 ============ -->
+<h2>7. 结论</h2>
+<ol>
+  <li><strong>完成度高。</strong>实现了 4 种对称密码算法共 <strong>11 种优化实现</strong>，覆盖 T-table、SIMD shuffle、bitslice、AES-NI <strong>四种指令集优化方法</strong>。</li>
+  <li><strong>接口统一。</strong>三种工作模式（CTR、GCM、XTS）均基于 <code>block_cipher_t</code> 接口实现，与具体密码算法<strong>解耦</strong>，可任意组合。所有 KAT 和功能测试均通过。</li>
+  <li><strong>硬件加速碾压级领先。</strong>AES-NI 达到 10.1 GB/s，是软件 T-table 的 24 倍、basic 的 127 倍。专用指令的不可替代性在此充分体现。</li>
+  <li><strong>T-table 是通用最优解。</strong>对 AES（+5.2×）和 SM4（+1.4×）均有效，不依赖特定指令集，跨平台性好。</li>
+  <li><strong>SIMD 效果因算法结构而异。</strong>SPN 结构（AES）适配度高，Feistel 结构（SM4）因旋转操作开销反而退化。</li>
+  <li><strong>Bitslice 适合轻量级密码。</strong>GIFT-128 和 TWINE-128 的 4-bit S-box 门电路简洁，在 128 并行分组上稳定收益（+2%~+34%）。</li>
+</ol>
+
+</body>
+</html>
